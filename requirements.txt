@@ -1,25 +1,29 @@
-# Web Frameworks
+# Web framework
 fastapi
-uvicorn
-streamlit
-requests
-python-multipart
+uvicorn[standard]
 
-# AI & LangChain
+# Frontend
+streamlit
+
+# HTTP
+requests
+
+# AI / LLM
+openai
 langchain
 langchain-openai
 langchain-community
-langchain-chroma
 langchain-text-splitters
-pydantic
-python-dotenv
+langchain-core
 
-# Data Processing
+# Vector DB — Pinecone (replaces ChromaDB)
+pinecone
+langchain-pinecone
+
+# Document loaders
 pypdf
 beautifulsoup4
+lxml
 
-# Search Engine
-tavily-python
-
-# Vector DB Helper
-chromadb
+# Utilities
+python-dotenv

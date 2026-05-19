@@ -4,41 +4,61 @@ from dotenv import load_dotenv
 
 # LangChain Core Components
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_chroma import Chroma
+from langchain_pinecone import PineconeVectorStore
 from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_community.chat_message_histories import ChatMessageHistory
 
+# Pinecone
+from pinecone import Pinecone, ServerlessSpec
+
 # --- 1. Environment and Basic Configuration ---
 load_dotenv()
-PERSIST_DIR = os.getenv("PERSIST_DIRECTORY", "./data/chroma_db")
+PINECONE_API_KEY   = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX     = os.getenv("PINECONE_INDEX_NAME", "gallery-ai")
 
 
 # --- 2. RAG Core Engine Class ---
 class RAGEngine:
     def __init__(self):
-        # Startup log in English
         print("🛠️ [SYSTEM] Starting Engine: Memory + MMR Rerank + Source Tracking enabled")
+
         self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-        self.vector_store = Chroma(
-            persist_directory=PERSIST_DIR,
-            embedding_function=self.embeddings
+
+        # --- Pinecone setup ---
+        pc = Pinecone(api_key=PINECONE_API_KEY)
+
+        # Create index if it doesn't exist yet
+        existing_indexes = [i["name"] for i in pc.list_indexes()]
+        if PINECONE_INDEX not in existing_indexes:
+            print(f"📦 [SYSTEM] Creating Pinecone index: {PINECONE_INDEX}")
+            pc.create_index(
+                name=PINECONE_INDEX,
+                dimension=1536,          # text-embedding-3-small output size
+                metric="cosine",
+                spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            )
+
+        self.vector_store = PineconeVectorStore(
+            index_name=PINECONE_INDEX,
+            embedding=self.embeddings,
+            pinecone_api_key=PINECONE_API_KEY,
         )
 
-        # MMR (Maximal Marginal Relevance) reduces redundant chunks and improves diversity
+        # MMR retriever — reduces redundant chunks and improves diversity
         self.retriever = self.vector_store.as_retriever(
             search_type="mmr",
             search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.6}
         )
 
-        # Planner: used for query rewriting and topic classification (non-streaming)
+        # Planner: query rewriting + topic classification (non-streaming)
         self.planner = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-        # Main LLM: used for final answer generation
+        # Main LLM: final answer generation
         self.llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
 
         # Persistent conversation memory
-        self.memory = ChatMessageHistory()
+        self.memory  = ChatMessageHistory()
         self.splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
 
     # ------------------------------------------------------------------
@@ -52,9 +72,9 @@ class RAGEngine:
         history_snippet = "\n".join(
             [f"{m.type}: {m.content}" for m in self.memory.messages[-4:]]
         )
-        # Prompt translated to English for logic consistency
         prompt = (
-            f"Based on the following conversation history, rewrite the user's new question into a standalone and complete search term.\n\n"
+            f"Based on the following conversation history, rewrite the user's new question "
+            f"into a standalone and complete search term.\n\n"
             f"Conversation History:\n{history_snippet}\n\n"
             f"New Question: {question}\n\n"
             f"Output only the rewritten text without any explanation."
@@ -69,7 +89,8 @@ class RAGEngine:
     def _classify_topic(self, question: str, context: str) -> str:
         """Classify the topic of the answer based on question and retrieved context."""
         prompt = (
-            f"Based on the question and references, summarize the topic in 2–4 English words (e.g., Product Info, Tech Support, Pricing, History).\n\n"
+            f"Based on the question and references, summarize the topic in 2–4 English words "
+            f"(e.g., Product Info, Tech Support, Pricing, History).\n\n"
             f"Question: {question}\n"
             f"Context Summary: {context[:500]}\n\n"
             f"Output only the topic category words."
@@ -83,7 +104,7 @@ class RAGEngine:
     @staticmethod
     def _extract_sources(docs) -> List[str]:
         """Extract unique source filenames/URLs from retrieved documents."""
-        seen = set()
+        seen    = set()
         sources = []
         for doc in docs:
             src = doc.metadata.get("source", "Unknown")
@@ -108,13 +129,16 @@ class RAGEngine:
 
         # 3. If nothing retrieved, respond honestly
         if not docs:
-            answer = "I'm sorry, I couldn't find any information related to this question in the knowledge base. Please upload relevant PDFs or URLs first."
+            answer = (
+                "I'm sorry, I couldn't find any information related to this question "
+                "in the knowledge base. Please upload relevant PDFs or URLs first."
+            )
             self.memory.add_user_message(question)
             self.memory.add_ai_message(answer)
             return answer, "No relevant data", []
 
         local_context = "\n\n".join([d.page_content for d in docs])
-        sources = self._extract_sources(docs)
+        sources       = self._extract_sources(docs)
 
         # 4. Confidence check
         check_prompt = (
@@ -176,7 +200,7 @@ class RAGEngine:
         print(f"\n🚀 [LOG] Received streaming request: {question}")
 
         refined_q = self._rewrite_query(question)
-        docs = self.retriever.invoke(refined_q)
+        docs      = self.retriever.invoke(refined_q)
         print(f"📚 [LOG] Retrieval complete, chunks recalled: {len(docs)}")
 
         if not docs:
@@ -221,9 +245,8 @@ class RAGEngine:
     def ingest_pdf(self, path: str) -> int:
         """Load a PDF, split into chunks, and add to the vector store."""
         print(f"📄 [SYSTEM] Parsing PDF: {path}")
-        loader = PyPDFLoader(path)
+        loader    = PyPDFLoader(path)
         documents = loader.load_and_split(self.splitter)
-        # Normalize source metadata
         for doc in documents:
             doc.metadata["source"] = os.path.basename(path)
         self.vector_store.add_documents(documents)
@@ -233,7 +256,7 @@ class RAGEngine:
     def ingest_url(self, url: str) -> int:
         """Scrape a URL, split into chunks, and add to the vector store."""
         print(f"🔗 [SYSTEM] Scraping URL: {url}")
-        loader = WebBaseLoader(url)
+        loader    = WebBaseLoader(url)
         documents = loader.load_and_split(self.splitter)
         for doc in documents:
             doc.metadata["source"] = url
@@ -244,10 +267,25 @@ class RAGEngine:
     def list_sources(self) -> List[str]:
         """Return a deduplicated list of all ingested sources."""
         try:
-            all_docs = self.vector_store.get()
-            metadatas = all_docs.get("metadatas", [])
-            sources = list({m.get("source", "Unknown") for m in metadatas if m})
-            return sorted(sources)
+            # Query with a dummy vector to fetch all metadata
+            index    = self.vector_store._index
+            stats    = index.describe_index_stats()
+            total    = stats.get("total_vector_count", 0)
+            if total == 0:
+                return []
+
+            # Fetch a sample batch to collect source metadata
+            results  = index.query(
+                vector=[0.0] * 1536,
+                top_k=min(total, 1000),
+                include_metadata=True
+            )
+            sources = sorted({
+                match["metadata"].get("source", "Unknown")
+                for match in results.get("matches", [])
+                if match.get("metadata")
+            })
+            return sources
         except Exception as e:
             print(f"❌ [ERROR] Failed to list sources: {e}")
             return []
@@ -255,15 +293,26 @@ class RAGEngine:
     def delete_source(self, source_path: str) -> Tuple[bool, str]:
         """Delete all chunks belonging to a specific source from the vector store."""
         try:
-            all_docs = self.vector_store.get()
+            index   = self.vector_store._index
+            stats   = index.describe_index_stats()
+            total   = stats.get("total_vector_count", 0)
+            if total == 0:
+                return False, f"Source not found: {source_path}"
+
+            results = index.query(
+                vector=[0.0] * 1536,
+                top_k=min(total, 10000),
+                include_metadata=True
+            )
             ids_to_delete = [
-                doc_id
-                for doc_id, meta in zip(all_docs["ids"], all_docs["metadatas"])
-                if meta.get("source") == source_path
+                match["id"]
+                for match in results.get("matches", [])
+                if match.get("metadata", {}).get("source") == source_path
             ]
             if not ids_to_delete:
                 return False, f"Source not found: {source_path}"
-            self.vector_store.delete(ids=ids_to_delete)
+
+            index.delete(ids=ids_to_delete)
             print(f"🗑️ [SYSTEM] Deleted source '{source_path}', removed {len(ids_to_delete)} chunks.")
             return True, f"Successfully deleted {len(ids_to_delete)} chunks (Source: {source_path})"
         except Exception as e:
